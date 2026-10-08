@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -27,7 +28,6 @@ type open struct {
 	X  string      `json:"x"`  // prefix the visitor used: "/<name>" or ""
 	O  string      `json:"o"`  // public origin, https://tunnel.example.workers.dev
 	WS bool        `json:"ws"` // websocket upgrade
-	C  string      `json:"c"`  // set the routing cookie to this name
 }
 
 var errAborted = errors.New("stream aborted")
@@ -58,7 +58,8 @@ type stream struct {
 
 func newStream(s *session, id uint32, ws bool) *stream {
 	ctx, cancel := context.WithCancel(s.ctx)
-	st := &stream{s: s, id: id, isWS: ws, ctx: ctx, cancel: cancel, credit: window, toLocal: &msgQueue{}}
+	st := &stream{s: s, id: id, isWS: ws, ctx: ctx, cancel: cancel, credit: window,
+		toLocal: &msgQueue{max: wsBacklog, total: &s.c.wsQueued}}
 	st.cond = sync.NewCond(&st.mu)
 	st.body = &bodyPipe{st: st}
 	st.body.cond = sync.NewCond(&st.body.mu)
@@ -97,9 +98,42 @@ func (st *stream) abort() {
 	st.toLocal.finish()
 }
 
+// queue hands a visitor websocket message to the local side, closing the
+// socket if the local app has fallen too far behind (per socket or overall).
+func (st *stream) queue(m wsMsg) {
+	if st.toLocal.push(m) {
+		return
+	}
+	st.abort()
+	p := make([]byte, 2, 2+32)
+	binary.BigEndian.PutUint16(p, uint16(websocket.StatusPolicyViolation))
+	st.s.send(fClose, st.id, append(p, "local app too slow"...))
+}
+
+// target builds the local URL. The path must start with "/", so nothing the
+// visitor (or a compromised server) sends can change which host is dialed.
+func (st *stream) target(scheme string, o open) (*url.URL, bool) {
+	if !strings.HasPrefix(o.U, "/") || (o.Q != "" && !strings.HasPrefix(o.Q, "?")) {
+		return nil, false
+	}
+	u, err := url.Parse(scheme + "://" + st.s.c.target + o.U + o.Q)
+	if err != nil || u.Host != st.s.c.target || u.User != nil {
+		return nil, false
+	}
+	return u, true
+}
+
 func (st *stream) serve(o open) {
 	defer st.s.remove(st.id)
 	defer st.cancel()
+	// If the local app answers before reading the whole body, unblock the
+	// transport's body reader instead of leaving it waiting forever.
+	defer st.body.finish(errAborted)
+	if blockedRequest(o.U, o.Q) {
+		st.s.reject(st.id, o.WS, http.StatusNotFound, "tunnel: not found\n")
+		st.s.c.logRequest(o.M, http.StatusNotFound, 0, o.X+o.U+o.Q)
+		return
+	}
 	if o.WS {
 		st.serveWS(o)
 	} else {
@@ -123,9 +157,18 @@ func (st *stream) serveHTTP(o open) {
 	case cl == 0, cl < 0 && (o.M == "GET" || o.M == "HEAD" || o.M == "OPTIONS"):
 		body, cl = http.NoBody, 0
 	}
-	req, err := http.NewRequestWithContext(st.ctx, o.M, c.localURL()+o.U+o.Q, body)
+	scheme := "http"
+	if c.localTLS {
+		scheme = "https"
+	}
+	u, ok := st.target(scheme, o)
+	if !ok {
+		st.respondText(http.StatusBadRequest, "tunnel: bad request\n")
+		return
+	}
+	req, err := http.NewRequestWithContext(st.ctx, o.M, u.String(), body)
 	if err != nil {
-		st.respondText(http.StatusBadRequest, "tunnel: "+err.Error()+"\n")
+		st.respondText(http.StatusBadRequest, "tunnel: bad request\n")
 		return
 	}
 	req.ContentLength = cl
@@ -141,15 +184,16 @@ func (st *stream) serveHTTP(o open) {
 		if st.ctx.Err() != nil {
 			return
 		}
-		msg := "tunnel: " + err.Error() + "\n"
+		// Visitors get a generic message; the details stay in this terminal.
 		var op *net.OpError
 		if errors.As(err, &op) && op.Op == "dial" {
-			msg = "tunnel: nothing answered on " + c.localURL() + "\n"
 			if !c.localDown.Swap(true) {
 				c.warn(c.target + " is not reachable (" + op.Err.Error() + ")")
 			}
+		} else {
+			c.warn(o.M + " " + shown + ": " + err.Error())
 		}
-		st.respondText(http.StatusBadGateway, msg)
+		st.respondText(http.StatusBadGateway, "tunnel: the local app isn't responding\n")
 		c.logRequest(o.M, http.StatusBadGateway, time.Since(start), shown)
 		return
 	}
@@ -172,10 +216,13 @@ func (st *stream) serveHTTP(o open) {
 	if resp.ContentLength >= 0 && !(noBody && o.M != "HEAD") {
 		h = append(h, [2]string{"Content-Length", strconv.FormatInt(resp.ContentLength, 10)})
 	}
-	if o.C != "" {
-		h = append(h, [2]string{"Set-Cookie", "_tunnel=" + o.C + "; Path=/; Secure; HttpOnly; SameSite=Lax"})
+	head, _ := json.Marshal(map[string]any{"s": resp.StatusCode, "h": h})
+	if len(head) > maxHead {
+		c.warn(o.M + " " + shown + ": response headers too large")
+		st.respondText(http.StatusBadGateway, "tunnel: the local app isn't responding\n")
+		return
 	}
-	if st.s.sendJSON(fRes, st.id, map[string]any{"s": resp.StatusCode, "h": h}) != nil {
+	if st.s.send(fRes, st.id, head) != nil {
 		return
 	}
 	c.logRequest(o.M, resp.StatusCode, time.Since(start), shown)
@@ -235,15 +282,20 @@ func (st *stream) serveWS(o open) {
 		}
 	}
 	c.forwardHeaders(hdr, o)
-	scheme := "ws://"
+	scheme := "ws"
 	if c.localTLS {
-		scheme = "wss://"
+		scheme = "wss"
+	}
+	u, ok := st.target(scheme, o)
+	if !ok {
+		st.s.sendJSON(fRes, st.id, map[string]any{"s": http.StatusBadRequest, "h": [][2]string{}})
+		return
 	}
 	dctx, dcancel := context.WithTimeout(st.ctx, 10*time.Second)
-	lc, resp, err := websocket.Dial(dctx, scheme+c.target+o.U+o.Q, &websocket.DialOptions{
+	lc, resp, err := websocket.Dial(dctx, u.String(), &websocket.DialOptions{
 		HTTPHeader:   hdr,
 		Subprotocols: protos,
-		HTTPClient:   &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}},
+		HTTPClient:   c.wsHTTP,
 	})
 	dcancel()
 	if err != nil {
@@ -256,7 +308,7 @@ func (st *stream) serveWS(o open) {
 		return
 	}
 	defer lc.CloseNow()
-	lc.SetReadLimit(-1)
+	lc.SetReadLimit(wsMaxMsg) // larger would exceed what the worker accepts and drop the whole tunnel
 
 	h := [][2]string{}
 	if p := lc.Subprotocol(); p != "" {
@@ -314,6 +366,10 @@ func (st *stream) serveWS(o open) {
 		if lc.Write(st.ctx, m.typ, m.data) != nil {
 			break
 		}
+		// Tell the worker the bytes are delivered so it can count what's in flight.
+		var w [4]byte
+		binary.BigEndian.PutUint32(w[:], uint32(len(m.data)))
+		st.s.send(fWin, st.id, w[:])
 	}
 	st.cancel()
 	<-done
@@ -323,6 +379,12 @@ func (st *stream) serveWS(o open) {
 // directly: Host is the local address, and Origin/Referer point at it too so
 // CSRF and dev-server host checks pass. The public view is in X-Forwarded-*.
 func (c *client) forwardHeaders(h http.Header, o open) {
+	// Drop anything a visitor could use to pose as a trusted proxy.
+	for k := range h {
+		if spoofableHeader(strings.ToLower(k)) {
+			delete(h, k)
+		}
+	}
 	pub, _ := url.Parse(o.O)
 	local := c.localURL()
 	if o.IP != "" {
@@ -389,7 +451,7 @@ func (c *client) isLocalHost(hostport string) bool {
 }
 
 func (c *client) warn(msg string) {
-	io.WriteString(c.out, "  "+c.paint("31", "✗")+" "+msg+"\n")
+	io.WriteString(c.out, "  "+c.paint("31", "✗")+" "+printable(msg)+"\n")
 }
 
 func stripPort(hostport string) string {
@@ -406,18 +468,23 @@ type bodyPipe struct {
 	mu      sync.Mutex
 	cond    *sync.Cond
 	chunks  [][]byte
+	queued  int
 	done    bool
 	err     error
 	unacked int
 }
 
-func (p *bodyPipe) push(b []byte) {
+// push queues body bytes; false if the sender ignored the window.
+func (p *bodyPipe) push(b []byte) bool {
 	p.mu.Lock()
 	if !p.done {
 		p.chunks = append(p.chunks, b)
+		p.queued += len(b)
 	}
+	over := p.queued > window+chunkSize
 	p.mu.Unlock()
 	p.cond.Signal()
+	return !over
 }
 
 func (p *bodyPipe) finish(err error) {
@@ -446,6 +513,7 @@ func (p *bodyPipe) Read(b []byte) (int, error) {
 		return 0, io.EOF
 	}
 	n := copy(b, p.chunks[0])
+	p.queued -= n
 	if p.chunks[0] = p.chunks[0][n:]; len(p.chunks[0]) == 0 {
 		p.chunks = p.chunks[1:]
 	}
@@ -463,7 +531,10 @@ func (p *bodyPipe) Read(b []byte) (int, error) {
 	return n, nil
 }
 
-func (p *bodyPipe) Close() error { return nil }
+func (p *bodyPipe) Close() error {
+	p.finish(errAborted) // no-op if the body already ended normally
+	return nil
+}
 
 type wsMsg struct {
 	typ    websocket.MessageType
@@ -476,24 +547,40 @@ type wsMsg struct {
 // msgQueue buffers visitor websocket messages so the session read loop
 // never blocks on a slow local app.
 type msgQueue struct {
-	mu   sync.Mutex
-	cond *sync.Cond
-	q    []wsMsg
-	done bool
+	mu    sync.Mutex
+	cond  *sync.Cond
+	q     []wsMsg
+	size  int
+	max   int
+	total *atomic.Int64 // shared by every queue in the session
+	done  bool
 }
 
-func (m *msgQueue) push(x wsMsg) {
+// push queues a message; false if the socket's backlog or the session's
+// would exceed its budget. One message on its own is always allowed.
+func (m *msgQueue) push(x wsMsg) bool {
+	n := len(x.data)
 	m.mu.Lock()
-	if !m.done {
-		m.q = append(m.q, x)
+	defer m.cond.Signal()
+	defer m.mu.Unlock()
+	if m.done {
+		return true
 	}
-	m.mu.Unlock()
-	m.cond.Signal()
+	if !x.close && m.size > 0 && (m.size+n > m.max || m.total.Load()+int64(n) > wsBudget) {
+		return false
+	}
+	m.q = append(m.q, x)
+	m.size += n
+	m.total.Add(int64(n))
+	return true
 }
 
+// finish stops the queue and releases whatever was still waiting.
 func (m *msgQueue) finish() {
 	m.mu.Lock()
 	m.done = true
+	m.total.Add(-int64(m.size))
+	m.q, m.size = nil, 0
 	m.mu.Unlock()
 	m.cond.Broadcast()
 }
@@ -509,5 +596,7 @@ func (m *msgQueue) pop() (wsMsg, bool) {
 	}
 	x := m.q[0]
 	m.q = m.q[1:]
+	m.size -= len(x.data)
+	m.total.Add(-int64(len(x.data)))
 	return x, true
 }

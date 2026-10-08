@@ -11,6 +11,8 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,9 +20,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -415,7 +419,7 @@ func TestLocalDown(t *testing.T) {
 	done := startClient(t, c)
 	pub := waitUp(t, c, done)
 	resp, body := get(t, pub)
-	if resp.StatusCode != 502 || !strings.Contains(body, "nothing answered on http://"+dead) {
+	if resp.StatusCode != 502 || body != "tunnel: the local app isn't responding\n" || strings.Contains(body, dead) {
 		t.Fatalf("%d %q", resp.StatusCode, body)
 	}
 	if !strings.Contains(out.String(), "is not reachable") {
@@ -494,3 +498,357 @@ type syncBuf struct {
 
 func (s *syncBuf) Write(p []byte) (int, error) { s.mu.Lock(); defer s.mu.Unlock(); return s.b.Write(p) }
 func (s *syncBuf) String() string              { s.mu.Lock(); defer s.mu.Unlock(); return s.b.String() }
+
+// --- security ---
+
+func securityApp() http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/", app())
+	mux.HandleFunc("/headers", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(r.Header)
+	})
+	mux.HandleFunc("/.well-known/ok", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "well-known") })
+	mux.HandleFunc("/evil", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Set-Cookie", "_tunnel=someone-else; Path=/")
+		w.Header().Add("Set-Cookie", "_tunnel_auth_victim=1.forged; Path=/")
+		w.Header().Add("Set-Cookie", "ok=1; Path=/")
+		w.Header().Set("Service-Worker-Allowed", "/")
+		w.Header().Set("Clear-Site-Data", `"cookies"`)
+	})
+	return mux
+}
+
+func TestSecurity(t *testing.T) {
+	pub, c, _, _ := tunnelFor(t, securityApp())
+	origin := strings.TrimSuffix(pub, "/"+c.name+"/")
+
+	t.Run("secret paths never reach the app", func(t *testing.T) {
+		for _, p := range []string{".env", ".env.local", ".ENV", "%2Eenv", ".git/config", "a/.git/HEAD",
+			"x%2F.env", ".ssh/id_rsa", "id_ed25519", ".aws/credentials", ".npmrc"} {
+			resp, body := get(t, pub+p)
+			if resp.StatusCode != 404 || body != "tunnel: not found\n" {
+				t.Errorf("/%s: %d %q", p, resp.StatusCode, body)
+			}
+		}
+		if _, body := get(t, pub+".well-known/ok"); body != "well-known" {
+			t.Errorf(".well-known blocked: %q", body)
+		}
+		if _, body := get(t, pub+"node_modules/.vite/deps/x.js"); body != "404 page not found\n" {
+			t.Errorf(".vite should reach the app: %q", body)
+		}
+	})
+
+	t.Run("visitors can't spoof forwarding headers or see tunnel cookies", func(t *testing.T) {
+		_, body := get(t, pub+"headers",
+			"X-Forwarded-For", "6.6.6.6", "Forwarded", "for=6.6.6.6", "X-Real-IP", "6.6.6.6",
+			"X-Forwarded-Host", "evil.com", "X-Forwarded-Prefix", "/evil", "True-Client-IP", "6.6.6.6",
+			"Cookie", "_tunnel="+c.name+"; app=1; _tunnel_auth_x=2")
+		var h http.Header
+		json.Unmarshal([]byte(body), &h)
+		// Behind a local dev proxy (worker on loopback) X-Forwarded-Host is
+		// trusted on purpose; on Cloudflare it never is.
+		devProxy := strings.HasSuffix(strings.TrimSuffix(origin, "/"), ".lcl")
+		if strings.Contains(body, "6.6.6.6") || strings.Contains(body, "/evil") || (!devProxy && strings.Contains(body, "evil.com")) {
+			t.Errorf("spoofed value reached the app: %s", body)
+		}
+		if h.Get("Forwarded") != "" || h.Get("X-Real-Ip") != "" || h.Get("Cf-Connecting-Ip") != "" {
+			t.Errorf("proxy headers leaked: %s", body)
+		}
+		if h.Get("Cookie") != "app=1" {
+			t.Errorf("cookie = %q, want app=1", h.Get("Cookie"))
+		}
+		if h.Get("X-Forwarded-For") == "" || h.Get("X-Forwarded-Prefix") != "/"+c.name {
+			t.Errorf("forwarding headers missing: %s", body)
+		}
+	})
+
+	t.Run("an app can't set tunnel cookies or origin-wide headers", func(t *testing.T) {
+		resp, _ := get(t, pub+"evil", "Cookie", "_tunnel="+c.name)
+		got := resp.Header.Values("Set-Cookie")
+		if len(got) != 1 || got[0] != "ok=1; Path=/" {
+			t.Errorf("set-cookie %q", got)
+		}
+		if resp.Header.Get("Service-Worker-Allowed") != "" || resp.Header.Get("Clear-Site-Data") != "" {
+			t.Errorf("origin-wide headers passed through: %v", resp.Header)
+		}
+	})
+
+	t.Run("service workers stay under the tunnel's path", func(t *testing.T) {
+		resp, _ := get(t, origin+"/sw.js", "Service-Worker", "script", "Cookie", "_tunnel="+c.name)
+		if resp.StatusCode != 403 {
+			t.Errorf("root-scope service worker: %d", resp.StatusCode)
+		}
+		if _, body := get(t, pub+"sw.js", "Service-Worker", "script"); body != "404 page not found\n" {
+			t.Errorf("prefixed service worker should reach the app: %q", body)
+		}
+	})
+
+	t.Run("absolute-path responses are never cached", func(t *testing.T) {
+		// /assets/app.js is a different file for every tunnel on the origin.
+		resp, _ := get(t, origin+"/assets/app.js", "Cookie", "_tunnel="+c.name)
+		if resp.Header.Get("Cache-Control") != "no-store" || resp.Header.Get("ETag") != "" {
+			t.Errorf("absolute path: cache-control %q etag %q", resp.Header.Get("Cache-Control"), resp.Header.Get("ETag"))
+		}
+		resp, _ = get(t, pub+"assets/app.js")
+		if resp.Header.Get("Cache-Control") == "no-store" {
+			t.Error("prefixed path should keep the app's own caching")
+		}
+	})
+
+	t.Run("unicode case folding can't sneak past the secret filter", func(t *testing.T) {
+		for _, p := range []string{".%C5%BFsh/id_rsa", ".%E2%84%AAube/config", ".%C5%BFSH/config"} {
+			if resp, body := get(t, pub+p); resp.StatusCode != 404 || body != "tunnel: not found\n" {
+				t.Errorf("/%s: %d %q", p, resp.StatusCode, body)
+			}
+		}
+	})
+
+	t.Run("two routing cookies are ignored", func(t *testing.T) {
+		_, body := get(t, origin+"/assets/app.js", "Cookie", "_tunnel="+c.name+"; _tunnel=someone-else")
+		if body == "console.log(1)" {
+			t.Error("an ambiguous routing cookie still routed the request")
+		}
+	})
+
+	t.Run("reserved paths", func(t *testing.T) {
+		resp, _ := get(t, origin+"/_tunnel/anything", "Cookie", "_tunnel="+c.name)
+		if resp.StatusCode != 404 {
+			t.Errorf("/_tunnel/anything: %d", resp.StatusCode)
+		}
+	})
+}
+
+func TestPassword(t *testing.T) {
+	server, token := testServer(t)
+	a := httptest.NewServer(securityApp())
+	t.Cleanup(a.Close)
+	c := newClient()
+	c.server, c.token, c.name, c.target = server, token, fmt.Sprintf("p%d", time.Now().UnixNano()%1e12), strings.TrimPrefix(a.URL, "http://")
+	c.auth = "me:hunter2"
+	pub := waitUp(t, c, startClient(t, c))
+	origin := strings.TrimSuffix(pub, "/"+c.name+"/")
+	basic := func(u, p string) string { return "Basic " + base64.StdEncoding.EncodeToString([]byte(u+":"+p)) }
+
+	resp, _ := get(t, pub+"headers")
+	if resp.StatusCode != 401 || !strings.HasPrefix(resp.Header.Get("WWW-Authenticate"), "Basic") {
+		t.Fatalf("no creds: %d %q", resp.StatusCode, resp.Header.Get("WWW-Authenticate"))
+	}
+	if resp, _ = get(t, pub+"headers", "Authorization", basic("me", "wrong")); resp.StatusCode != 401 {
+		t.Fatalf("wrong password: %d", resp.StatusCode)
+	}
+	resp, body := get(t, pub+"headers", "Authorization", basic("me", "hunter2"))
+	if resp.StatusCode != 200 || strings.Contains(body, "Authorization") {
+		t.Fatalf("right password: %d, app saw %s", resp.StatusCode, body)
+	}
+	var session string
+	for _, sc := range resp.Header.Values("Set-Cookie") {
+		if strings.HasPrefix(sc, "_tunnel_auth_"+c.name+"=") {
+			session = strings.SplitN(sc, ";", 2)[0]
+		}
+	}
+	if session == "" {
+		t.Fatalf("no session cookie: %q", resp.Header.Values("Set-Cookie"))
+	}
+	if resp, _ = get(t, pub+"hello", "Cookie", session); resp.StatusCode != 200 {
+		t.Fatalf("session cookie: %d", resp.StatusCode)
+	}
+	if resp, _ = get(t, origin+"/assets/app.js", "Cookie", session+"; _tunnel="+c.name); resp.StatusCode != 200 {
+		t.Fatalf("absolute path with session: %d", resp.StatusCode)
+	}
+	exp, _, _ := strings.Cut(strings.TrimPrefix(session, "_tunnel_auth_"+c.name+"="), ".")
+	forged := "_tunnel_auth_" + c.name + "=" + exp + ".AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	if resp, _ = get(t, pub+"hello", "Cookie", forged); resp.StatusCode != 401 {
+		t.Fatalf("forged cookie: %d", resp.StatusCode)
+	}
+	future := "_tunnel_auth_" + c.name + "=9999999999" + session[strings.Index(session, "."):]
+	if resp, _ = get(t, pub+"hello", "Cookie", future); resp.StatusCode != 401 {
+		t.Fatalf("extended expiry: %d", resp.StatusCode)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ws, _, err := websocket.Dial(ctx, strings.Replace(pub, "http", "ws", 1)+"ws",
+		&websocket.DialOptions{HTTPHeader: http.Header{"Cookie": {session}}, Subprotocols: []string{"echo.v1"}})
+	if err != nil {
+		t.Fatalf("websocket with session: %v", err)
+	}
+	ws.Close(websocket.StatusNormalClosure, "")
+	if _, _, err := websocket.Dial(ctx, strings.Replace(pub, "http", "ws", 1)+"ws", nil); err == nil {
+		t.Fatal("websocket without session was accepted")
+	}
+
+	limited := false
+	for range 80 {
+		if r, _ := get(t, pub+"hello", "Authorization", basic("me", "guess")); r.StatusCode == 429 {
+			limited = true
+			break
+		}
+	}
+	if !limited {
+		t.Error("80 wrong passwords in a row were never rate limited")
+	}
+}
+
+func TestTargetURL(t *testing.T) {
+	st := &stream{s: &session{c: &client{target: "localhost:3000"}}}
+	for _, o := range []open{{U: "@evil.com/x"}, {U: "evil.com"}, {U: ""}, {U: "/x", Q: "#y"}, {U: "/x", Q: "y"}} {
+		if u, ok := st.target("http", o); ok {
+			t.Errorf("%+v accepted as %s", o, u)
+		}
+	}
+	for _, o := range []open{{U: "/"}, {U: "//evil.com/x"}, {U: "/a@b"}, {U: "/x", Q: "?a=@evil.com"}} {
+		u, ok := st.target("http", o)
+		if !ok || u.Host != "localhost:3000" {
+			t.Errorf("%+v: %v %v", o, u, ok)
+		}
+	}
+}
+
+func TestHelpers(t *testing.T) {
+	if a, b := defaultName("salt1", "localhost:3000"), defaultName("salt1", "localhost:3000"); a != b || len(a) != 10 {
+		t.Errorf("unstable or wrong length: %q %q", a, b)
+	}
+	if defaultName("salt1", "localhost:3000") == defaultName("salt2", "localhost:3000") {
+		t.Error("salt ignored")
+	}
+	if got := printable("GET\x1b[2J /x\x07\u009b"); got != "GET[2J /x" {
+		t.Errorf("printable = %q", got)
+	}
+	for h, want := range map[string]bool{"localhost:3000": true, "127.0.0.1:80": true, "[::1]:8443": true,
+		"app.localhost:3000": false, "192.168.1.5:80": false, "example.com:443": false} {
+		if isLoopback(h) != want {
+			t.Errorf("isLoopback(%q) != %v", h, want)
+		}
+	}
+	q := &msgQueue{max: 10, total: new(atomic.Int64)}
+	q.cond = sync.NewCond(&q.mu)
+	if !q.push(wsMsg{data: make([]byte, 50)}) {
+		t.Error("one oversized message on an empty queue should be accepted")
+	}
+	if q.push(wsMsg{data: []byte{1}}) || !q.push(wsMsg{close: true}) {
+		t.Error("msgQueue cap")
+	}
+	q.finish()
+	if q.total.Load() != 0 {
+		t.Errorf("finish left %d bytes counted", q.total.Load())
+	}
+	for _, c := range []struct{ path, query string }{
+		{"/.env", ""}, {"/a/.git/config", ""}, {"/%2Eenv", ""}, {"/x%2F.ssh/id_rsa", ""}, {"/certs/server.PEM", ""},
+		{"/.config/tunnel/config", ""}, {"/db.sqlite3", ""}, {"/__web_console/repl_sessions/1", ""},
+		{"/_ignition/execute-solution", ""}, {"/_profiler/phpinfo", ""}, {"/", "?__debugger__=yes&cmd=1"},
+		{"/", "?__DEBUGGER__=yes"}, {"/%zz", ""}, {"/.%C5%BFsh/id_rsa", ""}, {"/.\u212Aube/config", ""}, {"/.ENV", ""},
+	} {
+		if !blockedRequest(c.path, c.query) {
+			t.Errorf("not blocked: %s%s", c.path, c.query)
+		}
+	}
+	for _, p := range []string{"/", "/.well-known/x", "/node_modules/.vite/deps/x.js", "/vite.config.ts", "/keys", "/api/monkey"} {
+		if blockedRequest(p, "?x=1") {
+			t.Errorf("blocked: %s", p)
+		}
+	}
+	if got := redactQuery("?token=abc&v=2&flag"); got != "?token=…&v=…&flag" {
+		t.Errorf("redactQuery = %q", got)
+	}
+	for _, c := range []struct{ server, token, cfgServer, cfgToken, wantServer, wantToken string }{
+		{"", "", "https://t.example.dev", "saved", "https://t.example.dev", "saved"},
+		{"t.example.dev", "", "https://t.example.dev", "saved", "https://t.example.dev", "saved"},
+		{"https://evil.dev", "", "https://t.example.dev", "saved", "", ""},
+		{"https://evil.dev", "mine", "https://t.example.dev", "saved", "https://evil.dev", "mine"},
+	} {
+		s, tok, err := credentials(c.server, c.token, c.cfgServer, c.cfgToken)
+		if s != c.wantServer || tok != c.wantToken || (c.wantToken == "") != (err != nil) {
+			t.Errorf("credentials(%q,%q) = %q %q %v", c.server, c.token, s, tok, err)
+		}
+	}
+	p := &bodyPipe{st: &stream{}}
+	p.cond = sync.NewCond(&p.mu)
+	if !p.push(make([]byte, window)) || p.push(make([]byte, chunkSize+1)) {
+		t.Error("bodyPipe should refuse bytes beyond the window")
+	}
+}
+
+func TestHardening(t *testing.T) {
+	// Something on this machine that must never be reachable through a redirect.
+	var internalHits atomic.Int32
+	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { internalHits.Add(1) }))
+	t.Cleanup(internal.Close)
+
+	mux := http.NewServeMux()
+	mux.Handle("/", app())
+	mux.HandleFunc("/reject", func(w http.ResponseWriter, r *http.Request) { http.Error(w, "no", 401) }) // never reads the body
+	mux.HandleFunc("/wsredirect", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, internal.URL+"/secret", http.StatusFound)
+	})
+	pub, _, _, _ := tunnelFor(t, mux)
+
+	t.Run("debug consoles and key files never reach the app", func(t *testing.T) {
+		for _, p := range []string{"?__debugger__=yes&cmd=resource", "__web_console/repl_sessions/1", "_ignition/execute-solution",
+			"_profiler/phpinfo", "__debug__/sql_select/", "certs/dev.pem", ".config/tunnel/config", "db.sqlite3"} {
+			resp, body := get(t, pub+p)
+			if resp.StatusCode != 404 || body != "tunnel: not found\n" {
+				t.Errorf("/%s: %d %q", p, resp.StatusCode, body)
+			}
+		}
+	})
+
+	t.Run("websocket dials don't follow redirects", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if _, _, err := websocket.Dial(ctx, strings.Replace(pub, "http", "ws", 1)+"wsredirect", nil); err == nil {
+			t.Fatal("websocket upgrade succeeded through a redirect")
+		}
+		time.Sleep(200 * time.Millisecond)
+		if n := internalHits.Load(); n != 0 {
+			t.Fatalf("redirect was followed to an internal server (%d hits)", n)
+		}
+	})
+
+	t.Run("early answers don't leak goroutines", func(t *testing.T) {
+		runtime.GC()
+		before := runtime.NumGoroutine()
+		for range 20 {
+			pr, pw := io.Pipe()
+			go func() { pw.Write(make([]byte, 64<<10)) }() // part of a 1MB body, then stall
+			req, _ := http.NewRequest("POST", pub+"reject", pr)
+			req.ContentLength = 1 << 20
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			resp, err := visitor.Do(req.WithContext(ctx))
+			if err == nil {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+			cancel()
+			pw.CloseWithError(errors.New("visitor gave up"))
+		}
+		visitor.CloseIdleConnections()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) && runtime.NumGoroutine() > before+10 {
+			time.Sleep(100 * time.Millisecond)
+		}
+		if after := runtime.NumGoroutine(); after > before+10 {
+			t.Fatalf("goroutines grew from %d to %d after 20 early-rejected uploads", before, after)
+		}
+	})
+
+	t.Run("an 18MB websocket message gets through", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		ws, _, err := websocket.Dial(ctx, strings.Replace(pub, "http", "ws", 1)+"ws", &websocket.DialOptions{Subprotocols: []string{"echo.v1"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ws.CloseNow()
+		ws.SetReadLimit(-1)
+		big := make([]byte, 18<<20)
+		rand.Read(big)
+		if err := ws.Write(ctx, websocket.MessageBinary, big); err != nil {
+			t.Fatal(err)
+		}
+		_, got, err := ws.Read(ctx)
+		if err != nil || !bytes.Equal(got, big) {
+			t.Fatalf("got %d bytes, %v", len(got), err)
+		}
+	})
+}

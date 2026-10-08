@@ -14,7 +14,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,8 +35,13 @@ const (
 	fClose = 7 // both: u16 code + reason
 	fRes   = 8 // client → worker: response head (JSON)
 
-	chunkSize = 256 << 10 // max body bytes per frame
-	window    = 4 << 20   // per-stream flow-control window
+	chunkSize  = 256 << 10 // max body bytes per frame
+	window     = 4 << 20   // per-stream flow-control window
+	maxStreams = 512       // concurrent visitor requests + websockets
+	wsBacklog  = 16 << 20  // visitor websocket bytes queued per socket for a slow local app
+	wsBudget   = 128 << 20 // and across all sockets
+	wsMaxMsg   = 32<<20 - 64
+	maxHead    = 1 << 20 // response head (status + headers) size
 )
 
 type client struct {
@@ -46,13 +50,19 @@ type client struct {
 	name     string
 	target   string // local host:port
 	localTLS bool
+	auth     string // "user:pass" visitors must send; goes to the worker inside the websocket
 
 	out   io.Writer
 	color bool
 	onUp  func(url string) // each time the tunnel is (re)established
 
-	tr        *http.Transport // to the local app
+	tr        *http.Transport // HTTP to the local app
+	wsHTTP    *http.Client    // websocket dials to the local app
 	localDown atomic.Bool
+	wsQueued  atomic.Int64 // visitor websocket bytes waiting for the local app
+
+	pinMu    sync.Mutex
+	dialAddr string // where "localhost:port" actually answers, once known
 }
 
 type fatalError struct{ msg string }
@@ -60,19 +70,74 @@ type fatalError struct{ msg string }
 func (e fatalError) Error() string { return e.msg }
 
 func newClient() *client {
-	return &client{
-		out: io.Discard,
-		tr: &http.Transport{
-			Proxy:               nil,
-			DialContext:         (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-			MaxIdleConnsPerHost: 256,
-			IdleConnTimeout:     90 * time.Second,
-			DisableCompression:  true, // pass bodies through exactly as the app encoded them
-			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-			WriteBufferSize:     64 << 10,
-			ReadBufferSize:      64 << 10,
-		},
+	c := &client{out: io.Discard}
+	c.tr = &http.Transport{
+		Proxy:                  nil,
+		DialContext:            c.dialLocal,
+		MaxIdleConnsPerHost:    256,
+		IdleConnTimeout:        90 * time.Second,
+		DisableCompression:     true, // pass bodies through exactly as the app encoded them
+		MaxResponseHeaderBytes: maxHead,
+		WriteBufferSize:        64 << 10,
+		ReadBufferSize:         64 << 10,
 	}
+	c.wsHTTP = &http.Client{
+		Transport: &http.Transport{
+			Proxy:                  nil,
+			DialContext:            c.dialLocal,
+			DisableKeepAlives:      true,
+			MaxResponseHeaderBytes: maxHead,
+		},
+		// A redirect from the local app must not send the visitor's websocket
+		// somewhere else on this machine's network.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	return c
+}
+
+// setLocalTLS decides certificate checking for an https/wss target:
+// self-signed is normal on loopback, anything else gets verified.
+func (c *client) setLocalTLS() {
+	cfg := &tls.Config{InsecureSkipVerify: isLoopback(c.target)}
+	c.tr.TLSClientConfig = cfg
+	c.wsHTTP.Transport.(*http.Transport).TLSClientConfig = cfg
+}
+
+// dialLocal connects to the target. For "localhost" it pins the address
+// family that actually answers, so another local process can't pick up
+// visitors by listening on the other one.
+func (c *client) dialLocal(ctx context.Context, network, addr string) (net.Conn, error) {
+	d := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+	if addr == c.target && strings.HasPrefix(c.target, "localhost:") {
+		c.pinMu.Lock()
+		if c.dialAddr == "" {
+			c.dialAddr = c.probeLocalhost(ctx)
+		}
+		pinned := c.dialAddr
+		c.pinMu.Unlock()
+		if pinned != "" {
+			addr = pinned
+		}
+	}
+	return d.DialContext(ctx, network, addr)
+}
+
+func (c *client) probeLocalhost(ctx context.Context) string {
+	port := c.target[len("localhost:"):]
+	try := func(host string) bool {
+		conn, err := (&net.Dialer{Timeout: 300 * time.Millisecond}).DialContext(ctx, "tcp", net.JoinHostPort(host, port))
+		if err == nil {
+			conn.Close()
+		}
+		return err == nil
+	}
+	switch {
+	case try("127.0.0.1"):
+		return net.JoinHostPort("127.0.0.1", port)
+	case try("::1"):
+		return net.JoinHostPort("::1", port)
+	}
+	return "" // nothing listening yet; try again on the next request
 }
 
 func (c *client) run(ctx context.Context) error {
@@ -82,7 +147,11 @@ func (c *client) run(ctx context.Context) error {
 		start := time.Now()
 		err := c.session(ctx, func(u string) {
 			if !up {
-				fmt.Fprintf(c.out, "\n  %s  %s  →  %s\n\n", c.paint("1", "tunnel"), c.paint("1;4", u), c.localURL())
+				lock := ""
+				if c.auth != "" {
+					lock = "  " + c.paint("2", "(password required)")
+				}
+				fmt.Fprintf(c.out, "\n  %s  %s  →  %s%s\n\n", c.paint("1", "tunnel"), c.paint("1;4", printable(u)), c.localURL(), lock)
 			} else {
 				fmt.Fprintf(c.out, "  %s\n", c.paint("32", "reconnected"))
 			}
@@ -104,7 +173,7 @@ func (c *client) run(ctx context.Context) error {
 			backoff = time.Second
 		}
 		wait := backoff/2 + rand.N(backoff/2+1)
-		fmt.Fprintf(c.out, "  %s %v, retrying in %s\n", c.paint("33", "disconnected:"), err, wait.Round(100*time.Millisecond))
+		fmt.Fprintf(c.out, "  %s %s, retrying in %s\n", c.paint("33", "disconnected:"), printable(err.Error()), wait.Round(100*time.Millisecond))
 		select {
 		case <-time.After(wait):
 		case <-ctx.Done():
@@ -127,11 +196,13 @@ func (c *client) session(ctx context.Context, onUp func(string)) error {
 	if err != nil || u.Host == "" {
 		return fatalError{"bad server address " + c.server}
 	}
-	switch u.Scheme {
-	case "https":
+	switch {
+	case u.Scheme == "https":
 		u.Scheme = "wss"
-	case "http":
+	case u.Scheme == "http" && isLoopback(u.Host):
 		u.Scheme = "ws"
+	default:
+		return fatalError{"refusing to send the token to " + c.server + ": use https"}
 	}
 	u.Path = "/_tunnel/connect"
 	u.RawQuery = "name=" + url.QueryEscape(c.name)
@@ -139,8 +210,13 @@ func (c *client) session(ctx context.Context, onUp func(string)) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	dctx, dcancel := context.WithTimeout(ctx, 15*time.Second)
+	hdr := http.Header{"Authorization": {"Bearer " + c.token}}
+	if c.auth != "" {
+		hdr.Set("X-Tunnel-Login", "1") // the password itself follows inside the websocket
+	}
 	ws, resp, err := websocket.Dial(dctx, u.String(), &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer " + c.token}},
+		HTTPHeader: hdr,
+		HTTPClient: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 	})
 	dcancel()
 	if err != nil {
@@ -161,7 +237,13 @@ func (c *client) session(ctx context.Context, onUp func(string)) error {
 		return err
 	}
 	defer ws.CloseNow()
-	ws.SetReadLimit(-1) // the worker caps messages at 32 MiB
+	ws.SetReadLimit(33 << 20) // the worker relays messages of up to 32 MiB plus a frame header
+	if c.auth != "" {
+		j, _ := json.Marshal(map[string]string{"t": "auth", "creds": c.auth})
+		if err := ws.Write(ctx, websocket.MessageText, j); err != nil {
+			return err
+		}
+	}
 
 	s := &session{c: c, ws: ws, ctx: ctx, streams: map[uint32]*stream{}}
 	go s.keepalive(cancel)
@@ -179,8 +261,14 @@ func (c *client) session(ctx context.Context, onUp func(string)) error {
 			return err
 		}
 		if typ == websocket.MessageText {
-			var m struct{ T, URL string }
+			var m struct {
+				T, URL string
+				Auth   bool
+			}
 			if json.Unmarshal(msg, &m) == nil && m.T == "ready" {
+				if c.auth != "" && !m.Auth {
+					return fatalError{"this worker doesn't support -auth yet; redeploy it before exposing anything"}
+				}
 				onUp(m.URL)
 			}
 			continue
@@ -221,10 +309,19 @@ func (s *session) dispatch(msg []byte) {
 			s.send(fRst, id, nil)
 			return
 		}
-		st := newStream(s, id, o.WS)
 		s.mu.Lock()
-		s.streams[id] = st
+		_, dup := s.streams[id]
+		full := len(s.streams) >= maxStreams || dup
+		var st *stream
+		if !full {
+			st = newStream(s, id, o.WS)
+			s.streams[id] = st
+		}
 		s.mu.Unlock()
+		if full {
+			s.reject(id, o.WS, http.StatusServiceUnavailable, "tunnel: too many open requests\n")
+			return
+		}
 		go st.serve(o)
 		return
 	}
@@ -237,12 +334,13 @@ func (s *session) dispatch(msg []byte) {
 	switch typ {
 	case fData:
 		if st.isWS {
-			st.toLocal.push(wsMsg{typ: websocket.MessageBinary, data: p})
-		} else {
-			st.body.push(p)
+			st.queue(wsMsg{typ: websocket.MessageBinary, data: p})
+		} else if !st.body.push(p) {
+			st.abort()
+			s.send(fRst, id, nil)
 		}
 	case fText:
-		st.toLocal.push(wsMsg{typ: websocket.MessageText, data: p})
+		st.queue(wsMsg{typ: websocket.MessageText, data: p})
 	case fEnd:
 		st.body.finish(nil)
 	case fWin:
@@ -278,6 +376,20 @@ func (s *session) sendJSON(typ byte, id uint32, v any) error {
 	return s.send(typ, id, j)
 }
 
+// reject answers a request without involving the local app.
+func (s *session) reject(id uint32, ws bool, code int, msg string) {
+	if ws {
+		s.sendJSON(fRes, id, map[string]any{"s": code, "h": [][2]string{}})
+		return
+	}
+	s.sendJSON(fRes, id, map[string]any{"s": code, "h": [][2]string{
+		{"Content-Type", "text/plain; charset=utf-8"},
+		{"Content-Length", strconv.Itoa(len(msg))},
+	}})
+	s.send(fData, id, []byte(msg))
+	s.send(fEnd, id, nil)
+}
+
 func (s *session) remove(id uint32) {
 	s.mu.Lock()
 	delete(s.streams, id)
@@ -306,8 +418,11 @@ func (c *client) logRequest(method string, code int, d time.Duration, path strin
 	case code >= 300:
 		col = "36"
 	}
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i] + redactQuery(path[i:])
+	}
 	fmt.Fprintf(c.out, "  %s  %-6s %s %6dms  %s\n",
-		c.paint("2", time.Now().Format("15:04:05")), method, c.paint(col, strconv.Itoa(code)), d.Milliseconds(), path)
+		c.paint("2", time.Now().Format("15:04:05")), printable(method), c.paint(col, strconv.Itoa(code)), d.Milliseconds(), printable(path))
 }
 
 func (c *client) localURL() string {
@@ -350,9 +465,9 @@ func parseTarget(s string) (addr string, https bool, err error) {
 	return s, https, nil
 }
 
-// defaultName is stable per machine + target, so restarting gives the same URL.
-func defaultName(target string) string {
-	host, _ := os.Hostname()
-	sum := sha256.Sum256([]byte(host + "|" + target))
-	return strings.ToLower(base32.StdEncoding.EncodeToString(sum[:])[:8])
+// defaultName is stable per machine + target, so restarting gives the same
+// URL, but unguessable: the salt is random and never leaves this machine.
+func defaultName(salt, target string) string {
+	sum := sha256.Sum256([]byte(salt + "|" + target))
+	return strings.ToLower(base32.StdEncoding.EncodeToString(sum[:])[:10])
 }
