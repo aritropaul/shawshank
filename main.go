@@ -16,6 +16,9 @@ import (
 	"golang.org/x/term"
 )
 
+// version is set at release time with -ldflags "-X main.version=v1.2.3".
+var version = "dev"
+
 const usage = `tunnel: expose a local port through your Cloudflare worker
 
   tunnel 3000                       https://tunnel.<you>.workers.dev/<name>/ → localhost:3000
@@ -23,6 +26,7 @@ const usage = `tunnel: expose a local port through your Cloudflare worker
   TUNNEL_AUTH=me:secret tunnel 3000 visitors must log in (HTTP Basic)
   tunnel https://localhost:8443     local service speaks TLS (cert not verified on loopback)
   tunnel login <server>             save server + token (token is read from stdin)
+  tunnel version                    print the version
 
 flags (anywhere on the line):
   -n name     path name (default: random, stable per machine + port)
@@ -47,6 +51,9 @@ func main() {
 		return
 	case "login":
 		err = login(args[1:])
+	case "version", "-v", "--version":
+		fmt.Println("tunnel", version)
+		return
 	default:
 		err = runClient(args)
 	}

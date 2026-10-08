@@ -1,5 +1,7 @@
 # shawshank
 
+[![ci](https://github.com/aritropaul/shawshank/actions/workflows/ci.yml/badge.svg)](https://github.com/aritropaul/shawshank/actions/workflows/ci.yml)
+
 Expose a local port to the internet through your own Cloudflare Worker. It works like ngrok, except the server is yours and it runs on the Workers free plan.
 
 ```
@@ -16,7 +18,7 @@ There are two parts: a Cloudflare Worker (`worker/`) that visitors hit, and a Go
 
 ## Setup
 
-You need a Cloudflare account (free is fine), Go 1.26.8 or newer, and Bun or Node.
+You need a Cloudflare account (free is fine) and Bun or Node to deploy the Worker.
 
 ### 1. Deploy the Worker
 
@@ -39,10 +41,18 @@ bunx wrangler secret put TOKEN   # paste it when asked
 
 ### 2. Install the CLI
 
-From the repo root:
+Download the binary for your platform into any directory on your `PATH`:
 
 ```sh
-go build -o ~/.local/bin/tunnel .    # any directory on your PATH works
+# macOS on Apple silicon; swap in darwin-amd64, linux-amd64 or linux-arm64
+curl -fsSL https://github.com/aritropaul/shawshank/releases/latest/download/tunnel-darwin-arm64.tar.gz | tar -xz -C ~/.local/bin
+```
+
+Windows builds are `tunnel-windows-amd64.zip` and `tunnel-windows-arm64.zip` on the [releases page](https://github.com/aritropaul/shawshank/releases/latest), which also has `SHA256SUMS`. To build it yourself instead, use Go 1.26.8 or newer from the repo root: `go build -o ~/.local/bin/tunnel .`
+
+Then point it at your Worker:
+
+```sh
 tunnel login https://tunnel.<your-subdomain>.workers.dev
 ```
 
@@ -145,6 +155,8 @@ bunx wrangler dev                # http://localhost:8787
 ```
 
 `bun run dev` does the same behind portless at `https://tunnel.lcl`. `bun run check` typechecks the Worker.
+
+`tunnel version` prints the version. Pushing a tag like `v1.2.3` builds the CLI for every platform and publishes a release; the annotated tag's message becomes the release notes.
 
 The tests are end-to-end: they start local apps and send real traffic through a running Worker. They read the token from `worker/.dev.vars`.
 
