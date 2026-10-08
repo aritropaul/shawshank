@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { font, home, page, wantsHTML, type Kind } from "./pages";
 
 // Wire protocol over the client's WebSocket. Every binary message is one frame:
 //   u8 type | u32 stream id (big endian) | payload
@@ -71,29 +72,38 @@ export default {
 			if (!(await allow(env.CONNECTS, ip))) return text("tunnel: too many attempts", 429);
 			return connect(req, env, url);
 		}
-		if (url.pathname.startsWith("/_tunnel/")) return text("tunnel: not found", 404);
-		if (!(await allow(env.VISITORS, ip))) return text("tunnel: too many requests", 429);
+		if (url.pathname.startsWith("/_tunnel/assets/")) return font(url.pathname.slice(16)) ?? fail(req, "not-found", "tunnel: not found", 404);
+		if (url.pathname.startsWith("/_tunnel/")) return fail(req, "not-found", "tunnel: not found", 404);
+		if (!(await allow(env.VISITORS, ip))) return fail(req, "slow", "tunnel: too many requests", 429);
 
 		// Who is this request for? /<name>/... is explicit. Absolute paths from a
 		// tunneled app (/assets/app.js, /src/App.tsx) carry no name, so fall back
 		// to the page that asked for it (Referer) and then the last tunnel visited
 		// (cookie). A name that isn't the cookie's must prove it's live, since
 		// /src/... and /assets/... look like names too.
+		//
+		// Only requests a page makes (its scripts, imports, fetches, link clicks)
+		// get the fallback. Anything you open yourself (a typed URL, the base URL,
+		// a bookmark, a reload) is routed by its path alone.
+		const fromPage = req.headers.get("sec-fetch-site") === "same-origin";
 		const seg = url.pathname.split("/")[1] ?? "";
 		const name = NAME.test(seg) ? seg : "";
-		const ref = refererName(req, url);
-		const cookie = cookieName(req);
+		const ref = fromPage ? refererName(req, url) : "";
+		const cookie = fromPage ? cookieName(req) : "";
 		if (name && name === cookie) return route(req, env, ip, name, true);
 
 		const candidates = [...new Set([name, ref, cookie].filter(Boolean))];
-		if (candidates.length === 0) return url.pathname === "/" ? text("tunnel") : text("tunnel: not found", 404);
+		if (candidates.length === 0) {
+			if (url.pathname !== "/") return fail(req, "not-found", "tunnel: not found", 404);
+			return wantsHTML(req) ? home(publicHost(req, url)) : text("tunnel");
+		}
 		for (const [i, c] of candidates.entries()) {
 			if (i === candidates.length - 1) return route(req, env, ip, c, c === name);
 			const r = await isLive(env, ip, c, c === name);
-			if (r === "slow") return text("tunnel: too many requests", 429);
+			if (r === "slow") return fail(req, "slow", "tunnel: too many requests", 429);
 			if (r) return route(req, env, ip, c, c === name);
 		}
-		return text("tunnel: not found", 404);
+		return fail(req, "not-found", "tunnel: not found", 404);
 	},
 } satisfies ExportedHandler<Env>;
 
@@ -127,7 +137,7 @@ async function connect(req: Request, env: Env, url: URL): Promise<Response> {
 // route forwards to a tunnel, rate-limiting lookups of names this isolate
 // hasn't seen live (scanners guessing names cost a Durable Object call each).
 async function route(req: Request, env: Env, ip: string, name: string, strip: boolean): Promise<Response> {
-	if (!fresh(live, name) && !(await allow(env.PROBES, ip))) return text("tunnel: too many requests", 429);
+	if (!fresh(live, name) && !(await allow(env.PROBES, ip))) return fail(req, "slow", "tunnel: too many requests", 429);
 	const res = await forward(req, env, name, strip);
 	if (res.headers.get("x-tunnel-offline") === "1") {
 		live.delete(name);
@@ -227,6 +237,10 @@ interface Stream {
 	resolve: (r: Response) => void;
 	cookies: string[]; // Set-Cookie headers the worker adds to the response
 	absolute: boolean; // reached without the /<name>/ prefix
+	html: boolean; // the visitor is a browser: errors get a page
+	name: string;
+	path: string; // as the visitor asked for it
+	discard: boolean; // the response was replaced by an error page; ignore its body
 	writer?: WritableStreamDefaultWriter<Uint8Array>;
 	credit: number; // request-body bytes we may still send
 	inflight: number; // request-body bytes sent but not yet delivered
@@ -297,40 +311,40 @@ export class Tunnel extends DurableObject<Env> {
 		const name = req.headers.get("x-tunnel-name") ?? "";
 		const ctl = this.ctl();
 		if (!ctl) {
-			const r = text(`tunnel: ${name} is offline`, 502);
+			const r = fail(req, "offline", `tunnel: ${name} is offline`, 502, name);
 			r.headers.set("x-tunnel-offline", "1");
 			return r;
 		}
 
 		const prefix = req.headers.get("x-tunnel-prefix") ?? "";
 		const path = url.pathname.slice(prefix.length) || "/";
-		if (blocked(path, url.search)) return text("tunnel: not found", 404);
+		if (blocked(path, url.search)) return fail(req, "not-found", "tunnel: not found", 404, name);
 		// A service worker registered from an absolute path would control every
 		// tunnel on this origin. Keep them under /<name>/.
 		if (req.headers.get("service-worker") === "script" && prefix === "") {
-			return text("tunnel: service workers must live under /" + name + "/", 403);
+			return fail(req, "forbidden", "tunnel: service workers must live under /" + name + "/", 403, name);
 		}
 		const ip = clientKey(req);
 		if (
 			this.streams.size + this.ctx.getWebSockets("v").length >= MAX_STREAMS ||
 			(this.perIP.get(ip) ?? 0) + this.ctx.getWebSockets(`ip:${ip}`).length >= MAX_PER_IP
 		) {
-			return text("tunnel: too many open requests", 503);
+			return fail(req, "busy", "tunnel: too many open requests", 503, name);
 		}
 
 		const cookies: string[] = [];
 		const { auth, login } = ctl.deserializeAttachment() as Ctl;
-		if (login && !auth) return text("tunnel: starting", 503);
+		if (login && !auth) return fail(req, "starting", "tunnel: starting", 503, name);
 		let usedBasic = false;
 		if (auth) {
 			const r = await this.authorize(req, name, auth);
 			if (r === "deny") {
-				return new Response("tunnel: login required\n", {
-					status: 401,
-					headers: { "WWW-Authenticate": `Basic realm="${name}", charset="UTF-8"` },
-				});
+				// The browser shows its own sign-in prompt; the page is what's left if it's dismissed.
+				const res = fail(req, "login", "tunnel: login required", 401, name);
+				res.headers.set("WWW-Authenticate", `Basic realm="${name}", charset="UTF-8"`);
+				return res;
 			}
-			if (r === "slow") return text("tunnel: too many login attempts", 429);
+			if (r === "slow") return fail(req, "slow", "tunnel: too many login attempts", 429, name);
 			if (r !== "cookie") {
 				usedBasic = true;
 				cookies.push(r);
@@ -366,6 +380,7 @@ export class Tunnel extends DurableObject<Env> {
 		const head = new Promise<Response>((resolve) => {
 			this.add({
 				id, ip, ws, head: req.method === "HEAD", resolve, cookies, absolute: prefix === "",
+				html: wantsHTML(req), name, path: url.pathname, discard: false,
 				credit: WINDOW, inflight: 0, closed: false, dropped: false, buffered: 0,
 			});
 		});
@@ -559,6 +574,10 @@ export class Tunnel extends DurableObject<Env> {
 					break;
 				case DATA: {
 					const n = payload.length;
+					if (st.discard) {
+						this.sendCtl(WIN, id, u32(n));
+						break;
+					}
 					if (!st.writer) throw new Error("body before head");
 					st.buffered += n;
 					this.buffered += n;
@@ -607,6 +626,15 @@ export class Tunnel extends DurableObject<Env> {
 	}
 
 	respond(st: Stream, res: { s: number; h: [string, string][] }): void {
+		// Errors the client produced itself (app down, blocked path, busy) are
+		// tagged; browsers get the page instead of the one-line text.
+		const tag = res.h.find(([k]) => String(k).toLowerCase() === "x-tunnel-error")?.[1];
+		res.h = res.h.filter(([k]) => String(k).toLowerCase() !== "x-tunnel-error");
+		if (tag && st.html && !st.ws && KINDS.has(tag)) {
+			st.discard = true;
+			st.resolve(page(tag as Kind, st.name, st.path, okStatus(res.s)));
+			return;
+		}
 		const headers = new Headers();
 		for (const [k, v] of res.h) {
 			const lk = String(k).toLowerCase();
@@ -671,7 +699,7 @@ export class Tunnel extends DurableObject<Env> {
 		this.outbound -= st.inflight;
 		st.inflight = 0;
 		this.wakeAll();
-		st.resolve(text(`tunnel: ${why}`, 502));
+		st.resolve(st.html ? page("local-down", st.name, st.path, 502) : text(`tunnel: ${why}`, 502));
 		st.writer?.abort(why).catch(() => {});
 	}
 
@@ -714,6 +742,13 @@ export class Tunnel extends DurableObject<Env> {
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
+
+const KINDS = new Set(["not-found", "offline", "local-down", "login", "slow", "busy", "starting", "forbidden", "bad-request"]);
+
+// fail answers with a page for browsers and a line of text for everything else.
+function fail(req: Request, kind: Kind, plain: string, status: number, name = "", path = new URL(req.url).pathname): Response {
+	return wantsHTML(req) ? page(kind, name, path, status) : text(plain, status);
+}
 
 function text(body: string, status = 200): Response {
 	return new Response(body + "\n", {

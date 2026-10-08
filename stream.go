@@ -130,7 +130,7 @@ func (st *stream) serve(o open) {
 	// transport's body reader instead of leaving it waiting forever.
 	defer st.body.finish(errAborted)
 	if blockedRequest(o.U, o.Q) {
-		st.s.reject(st.id, o.WS, http.StatusNotFound, "tunnel: not found\n")
+		st.s.reject(st.id, o.WS, http.StatusNotFound, "not-found", "tunnel: not found\n")
 		st.s.c.logRequest(o.M, http.StatusNotFound, 0, o.X+o.U+o.Q)
 		return
 	}
@@ -163,12 +163,12 @@ func (st *stream) serveHTTP(o open) {
 	}
 	u, ok := st.target(scheme, o)
 	if !ok {
-		st.respondText(http.StatusBadRequest, "tunnel: bad request\n")
+		st.respondText(http.StatusBadRequest, "bad-request", "tunnel: bad request\n")
 		return
 	}
 	req, err := http.NewRequestWithContext(st.ctx, o.M, u.String(), body)
 	if err != nil {
-		st.respondText(http.StatusBadRequest, "tunnel: bad request\n")
+		st.respondText(http.StatusBadRequest, "bad-request", "tunnel: bad request\n")
 		return
 	}
 	req.ContentLength = cl
@@ -193,7 +193,7 @@ func (st *stream) serveHTTP(o open) {
 		} else {
 			c.warn(o.M + " " + shown + ": " + err.Error())
 		}
-		st.respondText(http.StatusBadGateway, "tunnel: the local app isn't responding\n")
+		st.respondText(http.StatusBadGateway, "local-down", "tunnel: the local app isn't responding\n")
 		c.logRequest(o.M, http.StatusBadGateway, time.Since(start), shown)
 		return
 	}
@@ -219,7 +219,7 @@ func (st *stream) serveHTTP(o open) {
 	head, _ := json.Marshal(map[string]any{"s": resp.StatusCode, "h": h})
 	if len(head) > maxHead {
 		c.warn(o.M + " " + shown + ": response headers too large")
-		st.respondText(http.StatusBadGateway, "tunnel: the local app isn't responding\n")
+		st.respondText(http.StatusBadGateway, "local-down", "tunnel: the local app isn't responding\n")
 		return
 	}
 	if st.s.send(fRes, st.id, head) != nil {
@@ -254,13 +254,8 @@ func (st *stream) serveHTTP(o open) {
 	}
 }
 
-func (st *stream) respondText(code int, msg string) {
-	st.s.sendJSON(fRes, st.id, map[string]any{"s": code, "h": [][2]string{
-		{"Content-Type", "text/plain; charset=utf-8"},
-		{"Content-Length", strconv.Itoa(len(msg))},
-	}})
-	st.s.send(fData, st.id, []byte(msg))
-	st.s.send(fEnd, st.id, nil)
+func (st *stream) respondText(code int, kind, msg string) {
+	st.s.reject(st.id, false, code, kind, msg)
 }
 
 func (st *stream) serveWS(o open) {

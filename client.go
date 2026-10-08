@@ -319,7 +319,7 @@ func (s *session) dispatch(msg []byte) {
 		}
 		s.mu.Unlock()
 		if full {
-			s.reject(id, o.WS, http.StatusServiceUnavailable, "tunnel: too many open requests\n")
+			s.reject(id, o.WS, http.StatusServiceUnavailable, "busy", "tunnel: too many open requests\n")
 			return
 		}
 		go st.serve(o)
@@ -376,8 +376,9 @@ func (s *session) sendJSON(typ byte, id uint32, v any) error {
 	return s.send(typ, id, j)
 }
 
-// reject answers a request without involving the local app.
-func (s *session) reject(id uint32, ws bool, code int, msg string) {
+// reject answers a request without involving the local app. kind tells the
+// worker which error page to show browsers; msg is the plain-text version.
+func (s *session) reject(id uint32, ws bool, code int, kind, msg string) {
 	if ws {
 		s.sendJSON(fRes, id, map[string]any{"s": code, "h": [][2]string{}})
 		return
@@ -385,6 +386,7 @@ func (s *session) reject(id uint32, ws bool, code int, msg string) {
 	s.sendJSON(fRes, id, map[string]any{"s": code, "h": [][2]string{
 		{"Content-Type", "text/plain; charset=utf-8"},
 		{"Content-Length", strconv.Itoa(len(msg))},
+		{"X-Tunnel-Error", kind},
 	}})
 	s.send(fData, id, []byte(msg))
 	s.send(fEnd, id, nil)

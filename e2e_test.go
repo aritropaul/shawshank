@@ -218,14 +218,14 @@ func TestTunnel(t *testing.T) {
 	})
 
 	t.Run("absolute path via cookie", func(t *testing.T) {
-		_, body := get(t, origin+"/assets/app.js", "Cookie", "_tunnel="+c.name)
+		_, body := get(t, origin+"/assets/app.js", "Cookie", "_tunnel="+c.name, "Sec-Fetch-Site", "same-origin")
 		if body != "console.log(1)" {
 			t.Fatalf("got %q", body)
 		}
 	})
 
 	t.Run("absolute path via referer", func(t *testing.T) {
-		_, body := get(t, origin+"/assets/app.js", "Referer", pub)
+		_, body := get(t, origin+"/assets/app.js", "Referer", pub, "Sec-Fetch-Site", "same-origin")
 		if body != "console.log(1)" {
 			t.Fatalf("got %q", body)
 		}
@@ -234,9 +234,22 @@ func TestTunnel(t *testing.T) {
 	t.Run("absolute path imported by an absolute-path module", func(t *testing.T) {
 		// /src/App.tsx imported from /src/main.tsx: Referer says "src", which is
 		// not a tunnel, so the cookie decides.
-		_, body := get(t, origin+"/assets/app.js", "Referer", origin+"/assets/main.js", "Cookie", "_tunnel="+c.name)
+		_, body := get(t, origin+"/assets/app.js", "Referer", origin+"/assets/main.js", "Cookie", "_tunnel="+c.name, "Sec-Fetch-Site", "same-origin")
 		if body != "console.log(1)" {
 			t.Fatalf("got %q", body)
+		}
+	})
+
+	t.Run("urls you open yourself ignore the cookie and referer", func(t *testing.T) {
+		// Typed URLs, bookmarks and reloads send Sec-Fetch-Site: none.
+		if _, body := get(t, origin+"/", "Cookie", "_tunnel="+c.name, "Sec-Fetch-Site", "none"); body != "tunnel\n" {
+			t.Errorf("base url went to the tunnel: %q", body)
+		}
+		if _, body := get(t, origin+"/assets/app.js", "Cookie", "_tunnel="+c.name, "Sec-Fetch-Site", "none"); body == "console.log(1)" {
+			t.Error("typed absolute path went to the tunnel through the cookie")
+		}
+		if _, body := get(t, pub+"hello", "Cookie", "_tunnel=someone-else", "Sec-Fetch-Site", "none"); !strings.HasPrefix(body, "host=") {
+			t.Errorf("explicit /<name>/ didn't reach its tunnel: %q", body)
 		}
 	})
 
@@ -575,7 +588,7 @@ func TestSecurity(t *testing.T) {
 	})
 
 	t.Run("service workers stay under the tunnel's path", func(t *testing.T) {
-		resp, _ := get(t, origin+"/sw.js", "Service-Worker", "script", "Cookie", "_tunnel="+c.name)
+		resp, _ := get(t, origin+"/sw.js", "Service-Worker", "script", "Cookie", "_tunnel="+c.name, "Sec-Fetch-Site", "same-origin")
 		if resp.StatusCode != 403 {
 			t.Errorf("root-scope service worker: %d", resp.StatusCode)
 		}
@@ -586,7 +599,7 @@ func TestSecurity(t *testing.T) {
 
 	t.Run("absolute-path responses are never cached", func(t *testing.T) {
 		// /assets/app.js is a different file for every tunnel on the origin.
-		resp, _ := get(t, origin+"/assets/app.js", "Cookie", "_tunnel="+c.name)
+		resp, _ := get(t, origin+"/assets/app.js", "Cookie", "_tunnel="+c.name, "Sec-Fetch-Site", "same-origin")
 		if resp.Header.Get("Cache-Control") != "no-store" || resp.Header.Get("ETag") != "" {
 			t.Errorf("absolute path: cache-control %q etag %q", resp.Header.Get("Cache-Control"), resp.Header.Get("ETag"))
 		}
@@ -605,7 +618,7 @@ func TestSecurity(t *testing.T) {
 	})
 
 	t.Run("two routing cookies are ignored", func(t *testing.T) {
-		_, body := get(t, origin+"/assets/app.js", "Cookie", "_tunnel="+c.name+"; _tunnel=someone-else")
+		_, body := get(t, origin+"/assets/app.js", "Cookie", "_tunnel="+c.name+"; _tunnel=someone-else", "Sec-Fetch-Site", "same-origin")
 		if body == "console.log(1)" {
 			t.Error("an ambiguous routing cookie still routed the request")
 		}
@@ -653,7 +666,7 @@ func TestPassword(t *testing.T) {
 	if resp, _ = get(t, pub+"hello", "Cookie", session); resp.StatusCode != 200 {
 		t.Fatalf("session cookie: %d", resp.StatusCode)
 	}
-	if resp, _ = get(t, origin+"/assets/app.js", "Cookie", session+"; _tunnel="+c.name); resp.StatusCode != 200 {
+	if resp, _ = get(t, origin+"/assets/app.js", "Cookie", session+"; _tunnel="+c.name, "Sec-Fetch-Site", "same-origin"); resp.StatusCode != 200 {
 		t.Fatalf("absolute path with session: %d", resp.StatusCode)
 	}
 	exp, _, _ := strings.Cut(strings.TrimPrefix(session, "_tunnel_auth_"+c.name+"="), ".")
@@ -849,6 +862,77 @@ func TestHardening(t *testing.T) {
 		_, got, err := ws.Read(ctx)
 		if err != nil || !bytes.Equal(got, big) {
 			t.Fatalf("got %d bytes, %v", len(got), err)
+		}
+	})
+}
+
+func TestErrorPages(t *testing.T) {
+	server, token := testServer(t)
+	html := func(url string) (*http.Response, string) {
+		return get(t, url, "Accept", "text/html,application/xhtml+xml")
+	}
+
+	t.Run("offline tunnel", func(t *testing.T) {
+		name := "gone-" + strconv.FormatInt(time.Now().UnixNano()%1e9, 36)
+		resp, body := html(server + "/" + name + "/")
+		if resp.StatusCode != 502 || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/html") ||
+			!strings.Contains(body, "<title>502 - Offline</title>") || !strings.Contains(body, "tunnel 3000 -n "+name) {
+			t.Fatalf("%d %s\n%s", resp.StatusCode, resp.Header.Get("Content-Type"), body)
+		}
+		if !strings.Contains(resp.Header.Get("Content-Security-Policy"), "default-src 'none'") || resp.Header.Get("Cache-Control") != "no-store" {
+			t.Errorf("headers: %v", resp.Header)
+		}
+		// Anything that isn't a browser still gets one line of text.
+		if _, body := get(t, server+"/"+name+"/"); body != "tunnel: "+name+" is offline\n" {
+			t.Errorf("plain: %q", body)
+		}
+	})
+
+	t.Run("not found escapes the path", func(t *testing.T) {
+		resp, body := html(server + "/robots.txt%3Cscript%3E")
+		if resp.StatusCode != 404 || !strings.Contains(body, "404 - Not found") || strings.Contains(body, "<script>") {
+			t.Fatalf("%d\n%s", resp.StatusCode, body)
+		}
+	})
+
+	t.Run("app not responding comes from the client and keeps the port private", func(t *testing.T) {
+		ln, _ := net.Listen("tcp", "127.0.0.1:0")
+		dead := ln.Addr().String()
+		ln.Close()
+		c := newClient()
+		c.server, c.token, c.name, c.target = server, token, fmt.Sprintf("e%d", time.Now().UnixNano()%1e12), dead
+		pub := waitUp(t, c, startClient(t, c))
+		resp, body := html(pub)
+		if resp.StatusCode != 502 || !strings.Contains(body, "502 - Bad gateway") || strings.Contains(body, dead) || resp.Header.Get("X-Tunnel-Error") != "" {
+			t.Fatalf("%d %v\n%s", resp.StatusCode, resp.Header, body)
+		}
+		resp, body = html(pub + ".env")
+		if resp.StatusCode != 404 || !strings.Contains(body, "404 - Not found") {
+			t.Fatalf("blocked path: %d\n%s", resp.StatusCode, body)
+		}
+	})
+
+	t.Run("home page", func(t *testing.T) {
+		resp, body := get(t, server+"/", "Accept", "text/html", "Sec-Fetch-Site", "none")
+		if resp.StatusCode != 200 || !strings.Contains(body, "<title>tunnel</title>") || !strings.Contains(body, "Expose a local port") ||
+			!strings.Contains(resp.Header.Get("Content-Security-Policy"), "default-src 'none'") {
+			t.Fatalf("%d\n%s", resp.StatusCode, body)
+		}
+		if _, body := get(t, server+"/"); body != "tunnel\n" {
+			t.Errorf("plain: %q", body)
+		}
+	})
+
+	t.Run("fonts", func(t *testing.T) {
+		for _, f := range []string{"geist-400", "geist-500", "geist-mono-400", "geist-pixel"} {
+			resp, body := get(t, server+"/_tunnel/assets/"+f+".woff2")
+			if resp.StatusCode != 200 || resp.Header.Get("Content-Type") != "font/woff2" ||
+				!strings.Contains(resp.Header.Get("Cache-Control"), "immutable") || !strings.HasPrefix(body, "wOF2") {
+				t.Errorf("%s: %d %v", f, resp.StatusCode, resp.Header)
+			}
+		}
+		if resp, _ := get(t, server+"/_tunnel/assets/../secret"); resp.StatusCode != 404 {
+			t.Errorf("unknown asset: %d", resp.StatusCode)
 		}
 	})
 }

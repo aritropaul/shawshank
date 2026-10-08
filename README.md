@@ -79,7 +79,7 @@ Flags can go before or after the port. If the connection drops, the CLI reconnec
 
 Each tunnel lives at `/<name>/` on your Worker, and the name is stripped before the request reaches your app: `/<name>/foo` arrives as `/foo`.
 
-Apps built for `/` also request absolute paths like `/assets/app.js` or `/src/App.tsx`, which have no name in them. The Worker routes those using the page that requested them (`Referer`) and a `_tunnel` cookie it sets on your first visit. A Vite dev server, hot reload included, works this way.
+Apps built for `/` also request absolute paths like `/assets/app.js` or `/src/App.tsx`, which have no name in them. When the app's own page makes such a request, the Worker routes it using that page (`Referer`) and a `_tunnel` cookie set on your visit. A Vite or Astro dev server, hot reload included, works this way. URLs you open yourself (typed, bookmarked, the base URL) never use that fallback; they go by their path alone, so the base URL stays the base URL no matter which tunnel you visited last.
 
 Your app sees the request as if it were local:
 
@@ -113,6 +113,8 @@ With `TUNNEL_AUTH=user:pass` (or `-auth`), visitors log in with HTTP Basic and g
 **Other details.** Visitors see generic error pages; details go to your terminal. Query string values are hidden in both the Worker's logs and your terminal. TLS certificates are only skipped for local targets on loopback addresses. When the target is `localhost`, the CLI pins the address family your app actually listens on, so another process can't catch visitors on the other one. Each deploy drops connected clients, and they reconnect on their own.
 
 ## Errors
+
+Browsers get an error page in the style of [portless](https://github.com/vercel-labs/portless), in light or dark to match the system. Everything else, like curl or `fetch`, gets the one line of text below.
 
 | You see | Meaning |
 |---|---|
