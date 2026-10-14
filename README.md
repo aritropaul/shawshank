@@ -72,6 +72,7 @@ Open the URL it prints. Press Ctrl-C to stop.
 tunnel 3000                      https://tunnel.<you>.workers.dev/<name>/ → localhost:3000
 tunnel 3000 -n myapp             https://tunnel.<you>.workers.dev/myapp/
 TUNNEL_AUTH=me:secret tunnel 3000   visitors have to log in first
+tunnel 4591 -n app -keep-prefix  the app itself lives under /app/ (strict mode, below)
 tunnel localhost:8080            host:port works too
 tunnel https://localhost:8443    the local app speaks HTTPS (self-signed is fine on localhost)
 ```
@@ -80,6 +81,7 @@ tunnel https://localhost:8443    the local app speaks HTTPS (self-signed is fine
 |---|---|
 | `-n name` | Path name. Default: random, but the same every time for this machine and port. |
 | `-auth user:pass` | Make visitors log in (HTTP Basic). Prefer `$TUNNEL_AUTH`, which other users can't see in `ps`. |
+| `-keep-prefix` | Strict mode: send the app the full `/<name>/...` path and nothing outside it. |
 | `-s url` | Worker URL. Overrides the saved login and `$TUNNEL_SERVER`. |
 | `-t token` | Token. Overrides the saved login and `$TUNNEL_TOKEN`. |
 
@@ -90,6 +92,25 @@ Flags can go before or after the port. If the connection drops, the CLI reconnec
 Each tunnel lives at `/<name>/` on your Worker, and the name is stripped before the request reaches your app: `/<name>/foo` arrives as `/foo`.
 
 Apps built for `/` also request absolute paths like `/assets/app.js` or `/src/App.tsx`, which have no name in them. When the app's own page makes such a request, the Worker routes it using that page (`Referer`) and a `_tunnel` cookie set on your visit. A Vite or Astro dev server, hot reload included, works this way. URLs you open yourself (typed, bookmarked, the base URL) never use that fallback; they go by their path alone, so the base URL stays the base URL no matter which tunnel you visited last.
+
+This keeps apps working without changes, but it isn't airtight. An app that thinks it lives at `/` builds links like `/overview`, so its client-side navigation writes un-prefixed URLs into the address bar, and those can collide with other tunnels.
+
+### Strict mode
+
+If the app can run under a base path, use `-keep-prefix`. The tunnel then hands it the full path (`/goldmine/overview`), never sets the routing cookie, and refuses anything that arrives without the prefix. Every link, navigation and asset stays under `/<name>/`, so tunnels can't leak into each other. Set the app's base path to match the name:
+
+- Next.js: `basePath: "/goldmine"` in `next.config`
+- Vite: `vite --base /goldmine/`
+- Astro: `base: "/goldmine"`
+- SvelteKit: `kit.paths.base`
+
+```sh
+tunnel 4591 -n goldmine -keep-prefix
+```
+
+If the Worker is too old to enforce strict mode, the CLI refuses to start instead of falling back.
+
+### What the app sees
 
 Your app sees the request as if it were local:
 

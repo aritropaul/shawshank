@@ -261,6 +261,7 @@ interface Ctl {
 	origin: string; // public origin, for the ready message
 	login: boolean; // the client asked for a password; it arrives as the first message
 	auth: string; // hex HMAC of the password (keyed by TOKEN), once received; "" for an open tunnel
+	keep: boolean; // strict: the app gets the full /<name>/ path and only prefixed requests
 }
 
 export class Tunnel extends DurableObject<Env> {
@@ -287,14 +288,15 @@ export class Tunnel extends DurableObject<Env> {
 	accept(req: Request, url: URL): Response {
 		const name = url.searchParams.get("name") ?? "";
 		const login = req.headers.get("x-tunnel-login") === "1";
+		const keep = req.headers.get("x-tunnel-keep-prefix") === "1";
 		// Last client wins: the old one is told it was replaced and exits.
 		for (const old of this.ctx.getWebSockets("ctl")) safeClose(old, 4001, "replaced");
 		this.closeAll("tunnel client reconnected");
 		const { 0: client, 1: server } = new WebSocketPair();
 		this.ctx.acceptWebSocket(server, ["ctl"]);
-		server.serializeAttachment({ name, origin: origin(req, url), login, auth: "" } satisfies Ctl);
+		server.serializeAttachment({ name, origin: origin(req, url), login, auth: "", keep } satisfies Ctl);
 		// A password-protected tunnel is announced only once its password has arrived.
-		if (!login) server.send(JSON.stringify({ t: "ready", url: `${origin(req, url)}/${name}/`, auth: false }));
+		if (!login) server.send(JSON.stringify({ t: "ready", url: `${origin(req, url)}/${name}/`, auth: false, keep }));
 		return new Response(null, { status: 101, webSocket: client });
 	}
 
@@ -310,7 +312,7 @@ export class Tunnel extends DurableObject<Env> {
 		if (!ctl.login || ctl.auth || !creds.includes(":")) return safeClose(ws, 4002, "bad login message");
 		const auth = await this.sign(`auth|${ctl.name}|${creds}`);
 		ws.serializeAttachment({ ...ctl, auth } satisfies Ctl);
-		ws.send(JSON.stringify({ t: "ready", url: `${ctl.origin}/${ctl.name}/`, auth: true }));
+		ws.send(JSON.stringify({ t: "ready", url: `${ctl.origin}/${ctl.name}/`, auth: true, keep: ctl.keep }));
 	}
 
 	async proxy(req: Request, url: URL): Promise<Response> {
@@ -322,12 +324,18 @@ export class Tunnel extends DurableObject<Env> {
 			return r;
 		}
 
-		const prefix = req.headers.get("x-tunnel-prefix") ?? "";
+		const meta = ctl.deserializeAttachment() as Ctl;
+		const viaPath = (req.headers.get("x-tunnel-prefix") ?? "") !== ""; // arrived as /<name>/...
+		// A strict tunnel (-keep-prefix) owns /<name>/ outright: its app sees the
+		// full path, and nothing that arrived without the prefix reaches it, so
+		// its routes and other tunnels' routes can't leak into each other.
+		if (meta.keep && !viaPath) return fail(req, "not-found", "tunnel: not found", 404, name);
+		const prefix = meta.keep ? "" : (req.headers.get("x-tunnel-prefix") ?? ""); // what the app doesn't see
 		const path = url.pathname.slice(prefix.length) || "/";
 		if (blocked(path, url.search)) return fail(req, "not-found", "tunnel: not found", 404, name);
 		// A service worker registered from an absolute path would control every
 		// tunnel on this origin. Keep them under /<name>/.
-		if (req.headers.get("service-worker") === "script" && prefix === "") {
+		if (req.headers.get("service-worker") === "script" && !viaPath) {
 			return fail(req, "forbidden", "tunnel: service workers must live under /" + name + "/", 403, name);
 		}
 		const ip = clientKey(req);
@@ -339,7 +347,7 @@ export class Tunnel extends DurableObject<Env> {
 		}
 
 		const cookies: string[] = [];
-		const { auth, login } = ctl.deserializeAttachment() as Ctl;
+		const { auth, login } = meta;
 		if (login && !auth) return fail(req, "starting", "tunnel: starting", 503, name);
 		let usedBasic = false;
 		if (auth) {
@@ -356,7 +364,9 @@ export class Tunnel extends DurableObject<Env> {
 				cookies.push(r);
 			}
 		}
-		if (prefix !== "" && cookieName(req) !== name) {
+		// The routing cookie helps apps that assume they live at /. Strict tunnels
+		// don't need it and don't set it.
+		if (viaPath && !meta.keep && cookieName(req) !== name) {
 			cookies.push(`${COOKIE}=${name}; Path=/; Secure; HttpOnly; SameSite=Lax`);
 		}
 
@@ -385,7 +395,7 @@ export class Tunnel extends DurableObject<Env> {
 		};
 		const head = new Promise<Response>((resolve) => {
 			this.add({
-				id, ip, ws, head: req.method === "HEAD", resolve, cookies, absolute: prefix === "",
+				id, ip, ws, head: req.method === "HEAD", resolve, cookies, absolute: !viaPath,
 				html: wantsHTML(req), name, path: url.pathname, discard: false,
 				credit: WINDOW, inflight: 0, closed: false, dropped: false, buffered: 0,
 			});

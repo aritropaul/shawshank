@@ -51,6 +51,7 @@ type client struct {
 	target   string // local host:port
 	localTLS bool
 	auth     string // "user:pass" visitors must send; goes to the worker inside the websocket
+	keep     bool   // strict: the app gets the full /<name>/ path and only prefixed requests
 
 	out   io.Writer
 	color bool
@@ -149,7 +150,10 @@ func (c *client) run(ctx context.Context) error {
 			if !up {
 				lock := ""
 				if c.auth != "" {
-					lock = "  " + c.paint("2", "(password required)")
+					lock += "  " + c.paint("2", "(password required)")
+				}
+				if c.keep {
+					lock += "  " + c.paint("2", "(app sees /"+c.name+"/…)")
 				}
 				fmt.Fprintf(c.out, "\n  %s  %s  →  %s%s\n\n", c.paint("1", "tunnel"), c.paint("1;4", printable(u)), c.localURL(), lock)
 			} else {
@@ -214,6 +218,9 @@ func (c *client) session(ctx context.Context, onUp func(string)) error {
 	if c.auth != "" {
 		hdr.Set("X-Tunnel-Login", "1") // the password itself follows inside the websocket
 	}
+	if c.keep {
+		hdr.Set("X-Tunnel-Keep-Prefix", "1")
+	}
 	ws, resp, err := websocket.Dial(dctx, u.String(), &websocket.DialOptions{
 		HTTPHeader: hdr,
 		HTTPClient: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
@@ -262,12 +269,15 @@ func (c *client) session(ctx context.Context, onUp func(string)) error {
 		}
 		if typ == websocket.MessageText {
 			var m struct {
-				T, URL string
-				Auth   bool
+				T, URL     string
+				Auth, Keep bool
 			}
 			if json.Unmarshal(msg, &m) == nil && m.T == "ready" {
 				if c.auth != "" && !m.Auth {
 					return fatalError{"this worker doesn't support -auth yet; redeploy it before exposing anything"}
+				}
+				if c.keep && !m.Keep {
+					return fatalError{"this worker doesn't support -keep-prefix yet; redeploy it"}
 				}
 				onUp(m.URL)
 			}

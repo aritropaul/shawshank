@@ -24,6 +24,7 @@ const usage = `tunnel: expose a local port through your Cloudflare worker
   tunnel 3000                       https://tunnel.<you>.workers.dev/<name>/ → localhost:3000
   tunnel 3000 -n myapp              https://tunnel.<you>.workers.dev/myapp/
   TUNNEL_AUTH=me:secret tunnel 3000 visitors must log in (HTTP Basic)
+  tunnel 3000 -n app -keep-prefix   app is served under /app/ itself (Next basePath, Vite base)
   tunnel https://localhost:8443     local service speaks TLS (cert not verified on loopback)
   tunnel login <server>             save server + token (token is read from stdin)
   tunnel version                    print the version
@@ -31,6 +32,9 @@ const usage = `tunnel: expose a local port through your Cloudflare worker
 flags (anywhere on the line):
   -n name     path name (default: random, stable per machine + port)
   -auth u:p   same as $TUNNEL_AUTH
+  -keep-prefix
+              send the app the full /<name>/... path and nothing outside it,
+              so its routes can't leak into other tunnels (needs a base path)
   -s server   worker URL   (default: saved login, or $TUNNEL_SERVER)
   -t token    token for that server (default: saved login, or $TUNNEL_TOKEN)
 
@@ -68,6 +72,7 @@ func runClient(args []string) error {
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	name := fs.String("n", "", "")
 	auth := fs.String("auth", os.Getenv("TUNNEL_AUTH"), "")
+	keep := fs.Bool("keep-prefix", false, "")
 	server := fs.String("s", "", "")
 	token := fs.String("t", "", "")
 	pos := parseInterspersed(fs, args)
@@ -97,7 +102,7 @@ func runClient(args []string) error {
 	fi, _ := os.Stdout.Stat()
 	c := newClient()
 	c.server, c.token, c.name = *server, *token, strings.ToLower(*name)
-	c.target, c.localTLS, c.auth = target, localTLS, *auth
+	c.target, c.localTLS, c.auth, c.keep = target, localTLS, *auth, *keep
 	c.setLocalTLS()
 	c.out = os.Stdout
 	c.color = fi != nil && fi.Mode()&os.ModeCharDevice != 0 && os.Getenv("NO_COLOR") == ""

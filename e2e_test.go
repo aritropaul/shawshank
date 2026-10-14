@@ -963,3 +963,76 @@ func TestErrorPages(t *testing.T) {
 		}
 	})
 }
+
+func TestKeepPrefix(t *testing.T) {
+	server, token := testServer(t)
+	name := fmt.Sprintf("k%d", time.Now().UnixNano()%1e12)
+	base := "/" + name
+	// Like a Next app with basePath: it only knows paths under its own prefix.
+	mux := http.NewServeMux()
+	mux.HandleFunc(base+"/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == base+"/old" {
+			http.Redirect(w, r, base+"/new", http.StatusFound)
+			return
+		}
+		fmt.Fprintf(w, "app path=%s", r.URL.Path)
+	})
+	mux.HandleFunc(base+"/_next/hmr", func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		if _, msg, err := c.Read(r.Context()); err == nil {
+			c.Write(r.Context(), websocket.MessageText, msg)
+		}
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { http.Error(w, "app 404 "+r.URL.Path, 404) })
+	a := httptest.NewServer(mux)
+	t.Cleanup(a.Close)
+
+	c := newClient()
+	c.server, c.token, c.name, c.target, c.keep = server, token, name, strings.TrimPrefix(a.URL, "http://"), true
+	pub := waitUp(t, c, startClient(t, c))
+	origin := strings.TrimSuffix(pub, base+"/")
+
+	resp, body := get(t, pub+"overview?x=1")
+	if body != "app path="+base+"/overview" {
+		t.Fatalf("app didn't get the full path: %q", body)
+	}
+	for _, sc := range resp.Header.Values("Set-Cookie") {
+		if strings.HasPrefix(sc, "_tunnel=") {
+			t.Errorf("strict tunnel set the routing cookie: %q", sc)
+		}
+	}
+	if resp, _ := get(t, pub+"old"); resp.Header.Get("Location") != base+"/new" {
+		t.Errorf("redirect: %q (must not be double-prefixed)", resp.Header.Get("Location"))
+	}
+
+	// Nothing without the prefix reaches it, however the request points at it.
+	for _, hdr := range [][]string{
+		{"Cookie", "_tunnel=" + name, "Sec-Fetch-Site", "same-origin"},
+		{"Referer", pub, "Sec-Fetch-Site", "same-origin"},
+		{"Cookie", "_tunnel=" + name, "Referer", pub, "Sec-Fetch-Site", "same-origin"},
+	} {
+		if _, body := get(t, origin+"/overview", hdr...); strings.HasPrefix(body, "app ") {
+			t.Errorf("un-prefixed request with %v reached the app: %q", hdr, body)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	ws, _, err := websocket.Dial(ctx, strings.Replace(pub, "http", "ws", 1)+"_next/hmr", &websocket.DialOptions{HTTPHeader: http.Header{"Origin": {origin}}})
+	if err != nil {
+		t.Fatalf("prefixed websocket: %v", err)
+	}
+	ws.Write(ctx, websocket.MessageText, []byte("hmr"))
+	if _, got, err := ws.Read(ctx); err != nil || string(got) != "hmr" {
+		t.Fatalf("echo: %q %v", got, err)
+	}
+	ws.Close(websocket.StatusNormalClosure, "")
+	if _, _, err := websocket.Dial(ctx, strings.Replace(origin, "http", "ws", 1)+"/_next/hmr",
+		&websocket.DialOptions{HTTPHeader: http.Header{"Origin": {origin}, "Cookie": {"_tunnel=" + name}}}); err == nil {
+		t.Error("an un-prefixed websocket reached the strict tunnel")
+	}
+}
