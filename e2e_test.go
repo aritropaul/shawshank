@@ -384,6 +384,33 @@ func TestTunnel(t *testing.T) {
 		}
 	})
 
+	t.Run("websocket at an absolute path opened by the page", func(t *testing.T) {
+		// Like Next's /_next/hmr: browsers send only Origin and Cookie on the
+		// handshake, no Sec-Fetch-Site or Referer.
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		u := strings.Replace(origin, "http", "ws", 1) + "/ws"
+		ws, _, err := websocket.Dial(ctx, u, &websocket.DialOptions{
+			Subprotocols: []string{"echo.v1"},
+			HTTPHeader:   http.Header{"Origin": {origin}, "Cookie": {"_tunnel=" + c.name}},
+		})
+		if err != nil {
+			t.Fatalf("same-origin socket: %v", err)
+		}
+		ws.Write(ctx, websocket.MessageText, []byte("hmr"))
+		if _, got, err := ws.Read(ctx); err != nil || string(got) != "hmr" {
+			t.Fatalf("echo: %q %v", got, err)
+		}
+		ws.Close(websocket.StatusNormalClosure, "")
+		// Another site's page can't use the visitor's cookie to reach the tunnel.
+		if _, _, err := websocket.Dial(ctx, u, &websocket.DialOptions{
+			Subprotocols: []string{"echo.v1"},
+			HTTPHeader:   http.Header{"Origin": {"https://evil.example"}, "Cookie": {"_tunnel=" + c.name}},
+		}); err == nil {
+			t.Fatal("a cross-site websocket was routed by the cookie")
+		}
+	})
+
 	t.Run("100 concurrent", func(t *testing.T) {
 		var wg sync.WaitGroup
 		errs := make(chan error, 100)

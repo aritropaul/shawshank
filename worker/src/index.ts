@@ -85,7 +85,13 @@ export default {
 		// Only requests a page makes (its scripts, imports, fetches, link clicks)
 		// get the fallback. Anything you open yourself (a typed URL, the base URL,
 		// a bookmark, a reload) is routed by its path alone.
-		const fromPage = req.headers.get("sec-fetch-site") === "same-origin";
+		//
+		// Browsers send no Sec-Fetch-* or Referer on a websocket handshake, only
+		// Origin, which page script can't set. Dev-server sockets like Next's
+		// /_next/hmr need the fallback, so a same-origin Origin counts.
+		const websocket = req.headers.get("Upgrade")?.toLowerCase() === "websocket";
+		const fromPage =
+			req.headers.get("sec-fetch-site") === "same-origin" || (websocket && req.headers.get("Origin") === origin(req, url));
 		const seg = url.pathname.split("/")[1] ?? "";
 		const name = NAME.test(seg) ? seg : "";
 		const ref = fromPage ? refererName(req, url) : "";
